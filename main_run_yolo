@@ -1,0 +1,121 @@
+from collections import defaultdict
+import cv2
+import numpy as np
+import time
+import csv
+from ultralytics import YOLO
+import os
+import sys
+import omegaconf
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+def get_model_path(filename):
+    """
+    获取模型文件的绝对路径：
+    - 如果是 exe 运行，取 exe 所在目录
+    - 如果是源码运行，取当前脚本所在目录
+    """
+    if getattr(sys, 'frozen', False):  # exe 打包运行
+        base_path = os.path.dirname(sys.executable)
+    else:  # 源码运行
+        base_path = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_path, filename)
+
+def rubbish_track(
+    model_path,
+    video_path,
+    output_video="output.avi",
+    tracker_cfg="bytetrack.yaml",
+    max_track_history=30
+):
+    # === 加载模型 ===
+    model = YOLO(model_path)
+    
+
+    # === 打开视频 ===
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    size = (width, height)
+
+    # === 保存输出视频 ===
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    videoWriter = cv2.VideoWriter(output_video, fourcc=fourcc, fps=fps, frameSize=size)
+
+    # === 数据结构 ===
+    track_history = defaultdict(lambda: [])
+    class_counts = defaultdict(int)
+    class_ratios = defaultdict(list)
+    counted_ids = set()
+    img_area = width * height
+
+    while cap.isOpened():
+        success, frame = cap.read()
+        if not success:
+            break
+
+        # 跟踪
+        results = list(model.track(frame, stream=True, persist=True, tracker=tracker_cfg))
+        if results:
+            r = results[0]
+            annotated_frame = r.plot()
+
+            if r.boxes.id is not None:
+                boxes = r.boxes.xywh.cpu().numpy()
+                track_ids = r.boxes.id.int().cpu().tolist()
+                class_ids = r.boxes.cls.int().cpu().tolist()
+                masks = r.masks.data.cpu().numpy() if r.masks is not None else None
+
+                for i, (box, track_id, cls_id) in enumerate(zip(boxes, track_ids, class_ids)):
+                    x, y, w, h = box
+                    track = track_history[track_id]
+                    track.append((float(x), float(y)))
+                    if len(track) > max_track_history:
+                        track.pop(0)
+
+                    # 画轨迹
+                    points = np.hstack(track).astype(np.int32).reshape((-1, 1, 2))
+                    cv2.polylines(annotated_frame, [points], isClosed=False, color=(230, 230, 230), thickness=2)
+
+                    # 统计
+                    if track_id not in counted_ids:
+                        counted_ids.add(track_id)
+                        class_name = model.names[cls_id]
+                        class_counts[class_name] += 1
+                        obj_area = masks[i].sum() if masks is not None else w * h
+                        ratio = obj_area / img_area
+                        class_ratios[class_name].append(ratio)
+
+            # 显示 & 保存
+            cv2.imshow("Rubbish Tracking", annotated_frame)
+            videoWriter.write(annotated_frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    videoWriter.release()
+    cv2.destroyAllWindows()
+
+    # === 保存统计结果 ===
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"object_summary_{timestamp}.csv"
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Class", "Count", "Avg_Area_Ratio(%)"])
+        for cls, count in class_counts.items():
+            ratios = class_ratios[cls]
+            avg_ratio = (sum(ratios) / len(ratios)) * 100 if ratios else 0
+            writer.writerow([cls, count, f"{avg_ratio:.2f}"])
+
+    print(f"✅ 统计结果已保存到 {filename}")
+
+
+if __name__ == "__main__":
+    # 自动从 exe 或脚本所在目录加载模型
+    model_file = get_model_path("best.pt")
+    rubbish_track(
+        model_path=model_file,
+        video_path=0
+    )
